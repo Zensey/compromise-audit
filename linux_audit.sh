@@ -573,11 +573,14 @@ echo "  ${BLD}Integrity of system binaries (package checksums)${RST}"
 if need_root; then
   if command -v debsums >/dev/null 2>&1; then
     DS=$(debsums -c 2>&1)
-    BAD=$(echo "$DS" | grep -E "$SYSPATH" | grep -v '^debsums:' | head -20)
+    # changed files are printed as bare paths; anything else is a tool diagnostic (e.g. "dpkg-query: no path found ...")
+    BAD=$(echo "$DS" | grep -E '^/' | grep -E "$SYSPATH" | head -20)
+    DSERR=$(echo "$DS" | grep -E '^(debsums|dpkg-query):' | grep -v 'missing file' | head -5)
     GONE=$(echo "$DS" | grep -E '^debsums: missing file ' | sed -E 's/^debsums: missing file ([^ ]+).*/\1/' | grep -E "$SYSPATH" | head -20)
     NOSUM=$(debsums -l 2>/dev/null | grep -c .)
     if [ -n "$BAD" ]; then alert "Modified system files (debsums):"; echo "$BAD" | sed 's/^/    /'
     else ok "debsums: no modified system files"; fi
+    [ -n "$DSERR" ] && info "debsums diagnostics (not treated as modifications):" && echo "$DSERR" | cut -c1-160 | sed 's/^/      /'
     [ -n "$GONE" ] && warn "System files listed by packages but missing on disk:" && echo "$GONE" | sed 's/^/    /'
     [ "$NOSUM" -gt 0 ] && info "$NOSUM package(s) ship no checksum list and were NOT verified (debsums -l)."
   elif command -v rpm >/dev/null 2>&1; then
