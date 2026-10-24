@@ -31,6 +31,12 @@ To test detections, plant indicators inside the container before running (never 
 
 Not testable in Docker: systemd units/timers, `journalctl`, kernel-module and firewall checks (container shares the host kernel), and the whole macOS script. Test those on a real machine/VM.
 
+## Gotchas
+
+- Avoid sed backreferences (`\1`) when editing via scripts: a non-raw Python string turns `\1` into the control character `\x01` and `bash -n` still passes. Prefer sed forms without backreferences, and check with `grep -c $'\x01' <script>`.
+- Debian container images create `/usr/sbin/policy-rc.d`; it is allowlisted in the unowned-executables check.
+
 ## Known gaps
 
+- The macOS signature-integrity and sealed-volume checks were written without access to a Mac and have not been run; test them on a real machine.
 - Rootkits can hide from any check run on the audited system; a clean result is not proof.

@@ -89,6 +89,11 @@ section "1. Built-in protection"
 if csrutil status 2>&1 | grep -q "status: enabled"; then ok "SIP enabled"
 else alert "SIP (System Integrity Protection) is disabled"; fi
 
+AR=$(csrutil authenticated-root status 2>&1)
+if echo "$AR" | grep -qi "status: enabled"; then ok "Sealed system volume (authenticated root) enabled"
+elif echo "$AR" | grep -qi "status: disabled"; then alert "Sealed system volume protection is disabled — system files are no longer cryptographically verified"
+fi
+
 if spctl --status 2>&1 | grep -q "assessments enabled"; then ok "Gatekeeper enabled"
 else alert "Gatekeeper is disabled — any app can run"; fi
 
@@ -362,6 +367,36 @@ HIDDEN=$(find /Users/Shared -name ".*" ! -name ".localized" ! -name ".DS_Store" 
 
 show "Apps installed/modified in last 14 days" \
   "find /Applications '$USER_HOME/Applications' -maxdepth 1 -name '*.app' -mtime -14 2>/dev/null" 30
+
+# ---------- signature integrity of installed software ----------
+# Apple's own files are covered by the sealed system volume; this covers third-party apps/binaries.
+# Like package checksums on Linux, this catches modification after install, not a re-signed binary.
+echo "  ${BLD}Signature integrity of installed apps and Homebrew binaries${RST}"
+info "Verifying signatures (can take a minute)..."
+BROKEN=""; UNSIGNED_APPS=""; NSIGNED=0
+for app in /Applications/*.app "$USER_HOME"/Applications/*.app; do
+  [ -d "$app" ] || continue
+  r=$(codesign --verify --deep --strict "$app" 2>&1)
+  if [ $? -eq 0 ]; then NSIGNED=$((NSIGNED+1))
+  elif echo "$r" | grep -q "not signed"; then UNSIGNED_APPS="${UNSIGNED_APPS}${app}${NL}"
+  else BROKEN="${BROKEN}${app}: $(echo "$r" | head -1 | cut -c1-120)${NL}"; fi
+done
+for f in /opt/homebrew/bin/* /usr/local/bin/*; do
+  [ -f "$f" ] || continue
+  file -bL "$f" 2>/dev/null | grep -q "Mach-O" || continue
+  r=$(codesign --verify "$f" 2>&1)
+  if [ $? -eq 0 ]; then NSIGNED=$((NSIGNED+1))
+  elif echo "$r" | grep -q "not signed"; then UNSIGNED_APPS="${UNSIGNED_APPS}${f}${NL}"
+  else BROKEN="${BROKEN}${f}: $(echo "$r" | head -1 | cut -c1-120)${NL}"; fi
+done
+if [ -n "$BROKEN" ]; then
+  alert "Apps/binaries whose signature no longer verifies (modified after install?):"
+  printf '%s' "$BROKEN" | head -20 | sed 's/^/    /'
+else ok "$NSIGNED signed app(s)/binary(ies) verified, none modified"; fi
+if [ -n "$UNSIGNED_APPS" ]; then
+  warn "Unsigned apps/binaries installed (normal for some open-source tools):"
+  printf '%s' "$UNSIGNED_APPS" | head -20 | sed 's/^/    /'
+fi
 
 TRUST_ADMIN=$(security dump-trust-settings -d 2>&1 | grep '^Cert ')
 if [ $IS_ROOT -eq 1 ]; then TRUST_USER=$(sudo -u "$REAL_USER" security dump-trust-settings 2>&1 | grep '^Cert ')

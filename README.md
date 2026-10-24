@@ -44,6 +44,7 @@ The scripts do not change the system. They contain no commands that delete, move
 
 ### 1. Built-in protection
 - SIP (System Integrity Protection) enabled — ALERT if disabled
+- Sealed system volume (`csrutil authenticated-root status`) enabled — ALERT if disabled (macOS 11+)
 - Gatekeeper enabled — ALERT if disabled
 - FileVault (disk encryption) — CHECK if off
 - Application Firewall — CHECK if off
@@ -92,6 +93,7 @@ For every `.plist` in `~/Library/LaunchAgents`, `/Library/LaunchAgents`, `/Libra
 - Executable files in `/private/tmp`, `/private/var/tmp`, `/Users/Shared` → CHECK
 - Hidden files in `/Users/Shared` → CHECK
 - Apps installed/modified in the last 14 days
+- Signature integrity of third-party software: `codesign --verify --deep --strict` for apps in `/Applications` and `~/Applications`, `codesign --verify` for Mach-O binaries in `/opt/homebrew/bin` and `/usr/local/bin` → ALERT if a signature no longer verifies (modified after install); unsigned items → CHECK. Apple's own files are covered by the sealed system volume. Like package checksums, this catches modification after install, not a re-signed binary.
 - Manually trusted root certificates (admin and user) → CHECK
 
 ### 7. Logs (7 days, `log show`)
@@ -168,7 +170,9 @@ For every `.plist` in `~/Library/LaunchAgents`, `/Library/LaunchAgents`, `/Libra
 - SUID/SGID files outside packages or in `/tmp`, `/home` → ALERT (requires `sudo`)
 - Files with Linux capabilities (`getcap`) → CHECK (requires `sudo`)
 - World-writable files in system paths → ALERT
-- Integrity of system binaries: `debsums`, `rpm -Va` or `pacman -Qk` → ALERT on changes (requires `sudo`; Debian needs the `debsums` package)
+- Package checksums: `debsums -c`, `rpm -Va` or `pacman -Qkk`, limited to `/bin`, `/sbin`, `/lib*`, `/usr/{bin,sbin,lib*,libexec}`, `/boot` → ALERT on modified files (requires `sudo`; Debian needs the `debsums` package). Files that packages list but that are missing on disk → CHECK. On Debian the number of packages that ship no checksum list (not verified) is reported.
+- Executables in `/usr/bin`, `/usr/sbin`, `/usr/lib*`, `/usr/libexec` that no package owns (compared against the dpkg/rpm/pacman file lists; `/bin`, `/sbin`, `/lib*` are treated as `/usr/...`) → ALERT in `/usr/{bin,sbin}`, CHECK deeper (installers may generate files there). Requires `sudo`.
+- Limitation: checksums and package databases live on the audited system, so an attacker with root can falsify them. These checks catch careless tampering (a replaced binary), not a careful adversary.
 - System binaries modified in the last 3 days (informational)
 - Docker: running containers, privileged containers → CHECK (with `sudo`)
 - Manually added root certificates → CHECK
