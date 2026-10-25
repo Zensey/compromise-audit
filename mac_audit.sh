@@ -29,6 +29,13 @@ REAL_USER="${SUDO_USER:-$(id -un)}"
 USER_HOME=$(dscl . -read "/Users/$REAL_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
 [ -n "$USER_HOME" ] || USER_HOME="$HOME"
 
+# Home directories of all users (for per-user checks)
+ALL_HOMES="$USER_HOME"
+for d in /Users/*; do
+  [ -d "$d" ] && [ "$d" != "/Users/Shared" ] && [ "$d" != "$USER_HOME" ] && ALL_HOMES="$ALL_HOMES $d"
+done
+[ $IS_ROOT -eq 1 ] && [ -d /var/root ] && ALL_HOMES="$ALL_HOMES /var/root"
+
 ALERTS=0; WARNS=0
 SUMMARY_ALERTS=""; SUMMARY_WARNS=""
 NL=$'\n'
@@ -251,6 +258,40 @@ fi
 [ $MINER_FOUND -eq 0 ] && ok "No crypto-miner indicators"
 
 # 5) sustained high CPU (miners keep CPU near 100%)
+# ---------- known C2 / RAT frameworks ----------
+echo "  ${BLD}Known C2 / RAT frameworks${RST}"
+RAT_NAMES='sliver|mythic|apfell|meterpreter|metsvc|msfvenom|msfconsole|cobaltstrike|cobalt_strike|havoc-?(client|teamserver)|poshc2|koadic|pupy|empire-?(agent|server)|starkiller|bruteratel|merlin-?agent|dnscat|icmpsh|weevely|mettle|osxrat|macshellz|evilginx|revshell|reverse_?shell'
+RAT_FOUND=0
+RATP=$(ps -axww -o pid=,user=,command= | grep -iE "$RAT_NAMES" | grep -v grep)
+if [ -n "$RATP" ]; then
+  RAT_FOUND=1
+  alert "Process matching a known C2/RAT framework:"
+  echo "$RATP" | cut -c1-200 | sed 's/^/    /'
+fi
+RATF=$(find /private/tmp /private/var/tmp /Users/Shared /opt /usr/local/bin $ALL_HOMES -maxdepth 4 \( -name node_modules -o -name .git -o -name Library \) -prune -o -type f -print 2>/dev/null \
+       | grep -iE "/[^/]*($RAT_NAMES)[^/]*$" | head -20)
+if [ -n "$RATF" ]; then
+  RAT_FOUND=1
+  alert "Files named like a known C2/RAT framework:"
+  echo "$RATF" | sed 's/^/    /'
+fi
+[ $RAT_FOUND -eq 0 ] && ok "No known C2/RAT framework names"
+
+# ---------- tunnels and proxy tooling ----------
+echo "  ${BLD}Tunnel / proxy tooling${RST}"
+TUNNEL_RE='^(ngrok|frpc|frps|chisel|cloudflared|ligolo|ligolo-ng|sshuttle|autossh|proxychains|proxychains4|tor|socat|gost|rathole|bore|nps|npc|dnscat2|iodine|iodined|ptunnel|stunnel|stunnel4|3proxy|microsocks|redsocks|revsocks)$'
+TUNP=$(ps -axo pid=,user=,comm= | awk -v re="$TUNNEL_RE" '{p=$1; u=$2; $1=""; $2=""; c=$0; sub(/^ +/,"",c); n=split(c,a,"/"); if (a[n] ~ re) print p, u, c}')
+SSHT=$(ps -axo pid=,user=,command= | grep -E '(^|[ /])ssh( |$)' | grep -E ' -[A-Za-z]*[RD]([[:space:]]|[0-9:]|\[)' | grep -v grep)
+if [ -n "$TUNP" ]; then
+  warn "Tunnel/proxy tools running (legitimate if you started them):"
+  echo "$TUNP" | sed 's/^/    /'
+fi
+if [ -n "$SSHT" ]; then
+  warn "SSH reverse (-R) or SOCKS (-D) tunnels running:"
+  echo "$SSHT" | cut -c1-200 | sed 's/^/    /'
+fi
+[ -z "$TUNP$SSHT" ] && ok "No tunnel/proxy tools or SSH tunnels running"
+
 HICPU=$(ps -axo pid=,%cpu=,user=,comm= | awk '$2>=80 && $4!~/(^|\/)(ps|awk|sort|head)$/' | sort -k2 -nr | head -10)
 if [ -n "$HICPU" ]; then
   warn "Processes using >=80% CPU right now (re-check later; miners keep CPU high constantly):"
@@ -260,12 +301,125 @@ fi
 show "Listening TCP ports" "lsof -nP -iTCP -sTCP:LISTEN | awk 'NR==1 || !seen[\$1\$9]++'" 40
 show "Established connections" "lsof -nP -iTCP -sTCP:ESTABLISHED | awk '{print \$1, \$2, \$3, \$9}' | column -t" 50
 
+# ---------- connections with process context ----------
+echo "  ${BLD}Outbound connections with process context${RST}"
+CONNS=""; REVSH=""; REVINT=""
+while IFS='|' read -r pid remote; do
+  [ -n "$pid" ] || continue
+  case "$remote" in 127.*|"[::1]"|::1|"") continue;; esac
+  exe=$(ps -p "$pid" -o comm= 2>/dev/null); [ -n "$exe" ] || continue
+  base="${exe##*/}"
+  CONNS="${CONNS}${exe}|${remote}${NL}"
+  case "$base" in
+    bash|sh|dash|zsh|ksh|fish|nc|ncat|netcat) REVSH="${REVSH}${base} (pid $pid) -> ${remote}${NL}";;
+    python*|Python|perl|ruby|node|php|lua)    REVINT="${REVINT}${base} (pid $pid) -> ${remote}${NL}";;
+  esac
+done < <(lsof -nP -iTCP -sTCP:ESTABLISHED 2>/dev/null | awk 'NR>1 && index($9,"->") {split($9,a,"->"); r=a[2]; sub(/:[0-9]+$/,"",r); gsub(/[][]/,"",r); print $2 "|" r}' | sort -u)
+if [ -n "$CONNS" ]; then
+  lastexe=""; sig=""
+  printf '%s' "$CONNS" | sort -u | head -40 | while IFS='|' read -r exe remote; do
+    case "$exe" in
+      /System/*|/usr/*|/bin/*|/sbin/*|/Library/Apple/*) sig="Apple/system";;
+      *) if [ "$exe" != "$lastexe" ]; then sig=$(check_sig "$exe" | cut -c1-50); lastexe="$exe"; fi;;
+    esac
+    printf '    %-16s %-44s [%s] -> %s\n' "${exe##*/}" "$exe" "$sig" "$remote"
+  done
+else
+  info "  (no non-local established connections)"
+fi
+if [ -n "$REVSH" ]; then
+  alert "Shell/netcat process holding a network connection (typical reverse shell):"
+  printf '%s' "$REVSH" | sort -u | sed 's/^/    /'
+fi
+if [ -n "$REVINT" ]; then
+  warn "Scripting interpreter holding a network connection (normal for many tools; verify):"
+  printf '%s' "$REVINT" | sort -u | head -15 | sed 's/^/    /'
+fi
+
+# ---------- reverse shell: stdin/stdout on a socket ----------
+echo "  ${BLD}Shells with stdin/stdout attached to a network socket${RST}"
+FDSH=$(lsof -nP -i -a -d 0,1 2>/dev/null | awk 'NR>1 {c=tolower($1); if (c ~ /^(bash|sh|dash|zsh|ksh|fish|nc|ncat|netcat)$/) print $1, "pid " $2, "fd " $4, $9}' | sort -u)
+FDINT=$(lsof -nP -i -a -d 0,1 2>/dev/null | awk 'NR>1 {c=tolower($1); if (c ~ /^(python|perl|ruby|node|php|lua)/) print $1, "pid " $2, "fd " $4, $9}' | sort -u)
+if [ -n "$FDSH" ]; then
+  alert "Shell/netcat whose stdin or stdout is a network socket (reverse/bind shell):"
+  echo "$FDSH" | cut -c1-200 | sed 's/^/    /'
+fi
+if [ -n "$FDINT" ]; then
+  warn "Interpreter with stdin/stdout on a network socket:"
+  echo "$FDINT" | cut -c1-200 | sed 's/^/    /'
+fi
+[ -z "$FDSH$FDINT" ] && ok "No shells wired to network sockets"
+
+# ---------- listeners reachable beyond localhost ----------
+echo "  ${BLD}Listeners reachable beyond localhost (unusual owners only)${RST}"
+LA=""; LC=""
+while IFS='|' read -r pid name; do
+  [ -n "$pid" ] || continue
+  case "$name" in 127.*|"[::1]"*|localhost*) continue;; esac
+  exe=$(ps -p "$pid" -o comm= 2>/dev/null); [ -n "$exe" ] || continue
+  base="${exe##*/}"
+  item="${base} (pid $pid) tcp/${name##*:} ${exe}"
+  case "$exe" in
+    /tmp/*|/private/tmp/*|/private/var/tmp/*|/var/tmp/*|/Users/Shared/*|*/.*) LA="${LA}${item} [temp/hidden path]${NL}"; continue;;
+  esac
+  case "$base" in
+    bash|sh|dash|zsh|ksh|fish|nc|ncat|netcat) LA="${LA}${item} [shell/netcat listener]${NL}"; continue;;
+    python*|Python|perl|ruby|node|php|lua|socat) LC="${LC}${item} [interpreter/relay]${NL}"; continue;;
+  esac
+  case "$exe" in
+    /System/*|/usr/*|/bin/*|/sbin/*|/Applications/*|/Library/*|/opt/homebrew/*) ;;
+    *) LC="${LC}${item} [outside system/app paths]${NL}";;
+  esac
+done < <(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $2 "|" $(NF-1)}' | sort -u)
+if [ -n "$LA" ]; then
+  alert "Suspicious listener exposed to the network:"
+  printf '%s' "$LA" | sort -u | sed 's/^/    /'
+fi
+if [ -n "$LC" ]; then
+  warn "Listener exposed to the network from an unusual owner (dev servers are normal; verify):"
+  printf '%s' "$LC" | sort -u | head -15 | sed 's/^/    /'
+fi
+[ -z "$LA$LC" ] && ok "No listeners from unusual owners exposed beyond localhost"
+
 if scutil --proxy | grep -Eq '(HTTPEnable|HTTPSEnable|SOCKSEnable|ProxyAutoConfigEnable) : 1'; then
   warn "System proxy configured — make sure it's yours (VPN/corporate)"
   scutil --proxy | sed 's/^/    /'
 else ok "No system proxy"; fi
 
 show "DNS servers" "scutil --dns | grep nameserver | sort -u" 10
+
+# Tunnel / VPN interfaces (utun0-utun3 without an IPv4 address are normal system interfaces)
+TUNIF=""
+for i in $(ifconfig -l 2>/dev/null); do
+  case "$i" in
+    utun*) ifconfig "$i" 2>/dev/null | grep -q 'inet ' && TUNIF="$TUNIF $i";;
+    ppp*|ipsec*|tun*|tap*|wg*) TUNIF="$TUNIF $i";;
+  esac
+done
+if [ -n "$TUNIF" ]; then
+  warn "Tunnel/VPN interfaces with addresses — make sure you set them up:$TUNIF"
+  for i in $TUNIF; do ifconfig "$i" 2>/dev/null | grep 'inet' | sed "s/^[[:space:]]*/    $i: /" | cut -c1-120; done
+else ok "No tunnel/VPN interfaces beyond system defaults"; fi
+VPNS=$(scutil --nc list 2>/dev/null | grep -v '^Available')
+[ -n "$VPNS" ] && info "Configured VPN services:" && echo "$VPNS" | cut -c1-140 | sed 's/^/    /'
+
+# ---------- time synchronization ----------
+echo "  ${BLD}Time synchronization${RST}"
+if need_root; then
+  NT=$(systemsetup -getusingnetworktime 2>&1)
+  NS=$(systemsetup -getnetworktimeserver 2>&1)
+  if echo "$NT$NS" | grep -qiE 'error|administrator access'; then
+    info "  systemsetup unavailable (grant Terminal Full Disk Access)."
+  else
+    if echo "$NT" | grep -qi ': on'; then ok "Network time sync enabled"
+    else warn "Network time sync is disabled — the clock can be moved to hide activity or break TLS/logs"; fi
+    SRV=$(echo "$NS" | sed 's/^[^:]*: *//')
+    case "$SRV" in
+      *.apple.com|*.apple.com.cn|"") ;;
+      *) warn "Non-Apple NTP server configured (corporate servers are normal): $SRV";;
+    esac
+  fi
+fi
 
 HOSTS=$(grep -vE '^[[:space:]]*(#|$)' /etc/hosts | grep -vE 'localhost|broadcasthost')
 if [ -n "$HOSTS" ]; then
@@ -409,7 +563,170 @@ else ok "No manually trusted root certificates"; fi
 info "Reminder: review browser extensions manually in each browser."
 
 # =====================================================================
-section "7. Logs (last 7 days)"
+section "7. User environment: SSH, secrets, git, package sources"
+
+# ---------- SSH client configuration, hooks, recent changes ----------
+echo "  ${BLD}SSH client configuration and login hooks${RST}"
+SSHC_HIT=0
+for f in /etc/ssh/ssh_config /etc/ssh/ssh_config.d/*.conf $(for h in $ALL_HOMES; do echo "$h/.ssh/config"; done); do
+  [ -f "$f" ] || continue
+  H=$(grep -inE '^[[:space:]]*(ProxyCommand|LocalCommand|KnownHostsCommand)|^[[:space:]]*PermitLocalCommand[[:space:]]+yes|^[[:space:]]*Match[[:space:]]+exec' "$f" 2>/dev/null)
+  if [ -n "$H" ]; then
+    SSHC_HIT=1
+    warn "Command-executing directives in $f (ProxyCommand is common for jump hosts; verify):"
+    echo "$H" | cut -c1-200 | sed 's/^/    /'
+  fi
+done
+[ $SSHC_HIT -eq 0 ] && ok "No ProxyCommand/LocalCommand directives in ssh_config files"
+[ -f /etc/ssh/sshrc ] && warn "/etc/ssh/sshrc exists — runs on every SSH login"
+for h in $ALL_HOMES; do
+  for f in "$h/.ssh/rc" "$h/.ssh/environment"; do
+    [ -f "$f" ] && warn "$f exists — runs/applies on every SSH login (persistence vector)"
+  done
+  R=$(find "$h/.ssh" -maxdepth 2 -type f -mtime -14 ! -name 'known_hosts*' ! -name authorized_keys 2>/dev/null)
+  [ -n "$R" ] && warn "Files in $h/.ssh changed in last 14 days: $(echo $R)"
+  if [ -d "$h/.gnupg" ]; then
+    R=$(find "$h/.gnupg" -maxdepth 1 -type f -name '*.conf' -mtime -14 2>/dev/null)
+    [ -n "$R" ] && warn "GnuPG config changed in last 14 days: $(echo $R)"
+    P=$(grep -hE '^[[:space:]]*pinentry-program' "$h/.gnupg/gpg-agent.conf" 2>/dev/null | grep -vE '/usr/(bin|lib)')
+    [ -n "$P" ] && warn "gpg-agent pinentry-program points outside /usr ($h): $P"
+  fi
+  if [ -d "$h/.config" ]; then
+    R=$(find "$h/.config" -maxdepth 4 -type f -perm -u+x -mtime -14 ! -name '*.so*' 2>/dev/null | head -15)
+    [ -n "$R" ] && warn "Executable files in $h/.config changed in last 14 days (app updates can do this; verify):" && echo "$R" | sed 's/^/    /'
+  fi
+done
+
+# ---------- credential files and permissions ----------
+echo "  ${BLD}Credential files and permissions${RST} ${DIM}(contents are never read or printed)${RST}"
+SECRETS=".aws/credentials .kube/config .docker/config.json .netrc .pgpass .git-credentials .npmrc .pypirc .config/gh/hosts.yml .azure/accessTokens.json .config/gcloud/application_default_credentials.json .s3cfg .vault-token .terraform.d/credentials.tfrc.json"
+SEC_N=0; SEC_WIDE=""; KEY_OPEN=""; ENV_N=0
+for h in $ALL_HOMES; do
+  for rel in $SECRETS; do
+    f="$h/$rel"; [ -f "$f" ] || continue
+    SEC_N=$((SEC_N+1))
+    m=$(stat -f '%Lp' "$f" 2>/dev/null)
+    [ -n "$m" ] && [ "${m: -2}" != "00" ] && SEC_WIDE="${SEC_WIDE}${f} (mode $m)${NL}"
+  done
+  if [ -d "$h/.ssh" ]; then
+    m=$(stat -f '%Lp' "$h/.ssh" 2>/dev/null)
+    [ -n "$m" ] && [ "${m: -2}" != "00" ] && SEC_WIDE="${SEC_WIDE}${h}/.ssh directory (mode $m)${NL}"
+    for k in "$h"/.ssh/id_*; do
+      [ -f "$k" ] || continue
+      case "$k" in *.pub) continue;; esac
+      head -c 200 "$k" 2>/dev/null | grep -q 'PRIVATE KEY' || continue
+      SEC_N=$((SEC_N+1))
+      m=$(stat -f '%Lp' "$k" 2>/dev/null)
+      [ -n "$m" ] && [ "${m: -2}" != "00" ] && SEC_WIDE="${SEC_WIDE}${k} (mode $m)${NL}"
+      if command -v ssh-keygen >/dev/null 2>&1 && ssh-keygen -y -P "" -f "$k" </dev/null >/dev/null 2>&1; then
+        KEY_OPEN="${KEY_OPEN}${k}${NL}"
+      fi
+    done
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    ENV_N=$((ENV_N+1))
+    m=$(stat -f '%Lp' "$f" 2>/dev/null)
+    [ -n "$m" ] && [ "${m: -2}" != "00" ] && SEC_WIDE="${SEC_WIDE}${f} (mode $m)${NL}"
+  done < <(find "$h" -maxdepth 4 \( -name node_modules -o -name .git -o -name .cache -o -name .npm -o -name .cargo -o -name .rustup -o -name snap \) -prune \
+           -o -type f \( -name '.env' -o -name '.env.*' \) ! -name '*.example' ! -name '*.sample' ! -name '*.template' -print 2>/dev/null | head -100)
+done
+info "Credential files found: $SEC_N · .env files found: $ENV_N"
+if [ -n "$SEC_WIDE" ]; then
+  warn "Credential files readable by group/others (should be 600):"
+  printf '%s' "$SEC_WIDE" | head -20 | sed 's/^/    /'
+else ok "Credential files are private (no group/other access)"; fi
+if [ -n "$KEY_OPEN" ]; then
+  warn "SSH private keys without a passphrase (anyone who reads the file can use them):"
+  printf '%s' "$KEY_OPEN" | sed 's/^/    /'
+fi
+
+# ---------- git hooks and configuration ----------
+echo "  ${BLD}Git hooks and configuration${RST}"
+GIT_KEYS='^[[:space:]]*(hookspath|sshcommand|fsmonitor|gitproxy|askpass)[[:space:]]*='
+GIT_HIT=0; GIT_HOOKS=""; GIT_EVIL=""; NREPO=0
+for gc in /etc/gitconfig $(for h in $ALL_HOMES; do echo "$h/.gitconfig $h/.config/git/config"; done); do
+  [ -f "$gc" ] || continue
+  H=$(grep -inE "$GIT_KEYS" "$gc" 2>/dev/null)
+  [ -n "$H" ] && GIT_HIT=1 && warn "Command-executing git settings in $gc:" && echo "$H" | cut -c1-200 | sed 's/^/    /'
+done
+for h in $ALL_HOMES; do
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    NREPO=$((NREPO+1))
+    H=$(grep -inE "$GIT_KEYS" "$g/config" 2>/dev/null)
+    [ -n "$H" ] && GIT_HIT=1 && warn "Command-executing git settings in $g/config:" && echo "$H" | cut -c1-200 | sed 's/^/    /'
+    for hk in "$g"/hooks/*; do
+      [ -f "$hk" ] && [ -x "$hk" ] || continue
+      case "$hk" in *.sample) continue;; esac
+      GIT_HOOKS="${GIT_HOOKS}${hk}${NL}"
+      grep -qE 'curl|wget|base64|/dev/tcp/|nc -e|bash -i|eval ' "$hk" 2>/dev/null && GIT_EVIL="${GIT_EVIL}${hk}${NL}"
+    done
+  done < <(find "$h" -maxdepth 5 \( -name node_modules -o -name .cache -o -name .npm -o -name .cargo -o -name .rustup -o -name .local -o -name snap -o -name go \) -prune \
+           -o -type d -name .git -print 2>/dev/null | head -300)
+done
+if [ -n "$GIT_EVIL" ]; then
+  alert "Git hooks containing download/obfuscation/shell patterns:"
+  printf '%s' "$GIT_EVIL" | sed 's/^/    /'
+fi
+if [ -n "$GIT_HOOKS" ]; then
+  warn "Active git hooks in $NREPO repo(s) (pre-commit/husky/lfs install these; verify unknown ones):"
+  printf '%s' "$GIT_HOOKS" | head -15 | sed 's/^/    /'
+fi
+[ $GIT_HIT -eq 0 ] && [ -z "$GIT_HOOKS" ] && ok "No suspicious git hooks/config in $NREPO repo(s)"
+
+# ---------- package sources ----------
+echo "  ${BLD}Package sources${RST}"
+SRC_BAD=0
+TAPS=""
+for t in /opt/homebrew/Library/Taps/* /usr/local/Homebrew/Library/Taps/*; do
+  [ -d "$t" ] || continue
+  for r in "$t"/*; do
+    [ -d "$r" ] || continue
+    name="$(basename "$t")/$(basename "$r")"
+    case "$name" in homebrew/*) continue;; esac
+    url=$(grep -m1 -E '^[[:space:]]*url[[:space:]]*=' "$r/.git/config" 2>/dev/null | sed 's/^[^=]*= *//' | sed 's#://[^/@ ]*@#://***@#')
+    TAPS="${TAPS}${name}  ${url}${NL}"
+  done
+done
+if [ -n "$TAPS" ]; then
+  SRC_BAD=1
+  warn "Third-party Homebrew taps (their formulae run arbitrary code at install):"
+  printf '%s' "$TAPS" | cut -c1-160 | sed 's/^/    /'
+fi
+BENV=$(grep -nE 'HOMEBREW_(BOTTLE_DOMAIN|API_DOMAIN|ARTIFACT_DOMAIN|BREW_GIT_REMOTE|CORE_GIT_REMOTE)' $(for h in $ALL_HOMES; do echo "$h/.zshrc $h/.zprofile $h/.zshenv $h/.bash_profile $h/.bashrc $h/.profile"; done) /etc/zshenv /etc/zprofile /etc/profile 2>/dev/null | sed 's#://[^/@ ]*@#://***@#')
+if [ -n "$BENV" ]; then
+  SRC_BAD=1
+  warn "Homebrew download/git sources overridden in shell files:"
+  echo "$BENV" | cut -c1-180 | sed 's/^/    /'
+fi
+[ $SRC_BAD -eq 0 ] && ok "Homebrew sources look standard"
+
+echo "  ${BLD}Language package indexes (pip / npm / yarn / cargo / gem)${RST}"
+IDX_FILES="/etc/pip.conf /etc/xdg/pip/pip.conf /etc/npmrc /usr/etc/npmrc"
+for h in $ALL_HOMES; do
+  IDX_FILES="$IDX_FILES $h/.pip/pip.conf $h/.config/pip/pip.conf $h/.pypirc $h/.npmrc $h/.yarnrc $h/.yarnrc.yml $h/.cargo/config.toml $h/.cargo/config $h/.gemrc $h/.bundle/config $h/.config/uv/uv.toml"
+done
+IDX_OFFICIAL='pypi\.org|pythonhosted\.org|registry\.npmjs\.org|registry\.yarnpkg\.com|crates\.io|rubygems\.org|github\.com'
+IDX_HIT=0
+for f in $IDX_FILES; do
+  [ -f "$f" ] || continue
+  L=$(grep -iE 'index-url|extra-index|trusted-host|find-links|registry|repository|replace-with|^[[:space:]]*(source|mirror|proxy)' "$f" 2>/dev/null \
+      | grep -viE 'token|_auth|password|secret' | sed 's#://[^/@ ]*@#://***@#' | grep -v '^[[:space:]]*#')
+  [ -n "$L" ] || continue
+  ODD=$(echo "$L" | grep -oE '[a-z]+://[^/[:space:]"]+' | grep -vE "$IDX_OFFICIAL")
+  if echo "$L" | grep -qiE 'extra-index-url|trusted-host' || [ -n "$ODD" ]; then
+    IDX_HIT=1
+    warn "Custom package index/registry in $f (internal mirrors are normal; unknown ones allow dependency substitution):"
+    echo "$L" | cut -c1-160 | sed 's/^/    /'
+  fi
+done
+ENVIDX=$(grep -nE '^[[:space:]]*(export[[:space:]]+)?(PIP_(EXTRA_)?INDEX_URL|NPM_CONFIG_REGISTRY|UV_(EXTRA_)?INDEX_URL|CARGO_REGISTRIES_[A-Z_]+_INDEX)=' /etc/environment /etc/profile /etc/profile.d/* $(for h in $ALL_HOMES; do echo "$h/.profile $h/.bashrc $h/.bash_profile $h/.zshrc $h/.zprofile $h/.zshenv"; done) 2>/dev/null | sed 's#://[^/@ ]*@#://***@#')
+[ -n "$ENVIDX" ] && IDX_HIT=1 && warn "Package index overridden via environment in shell files:" && echo "$ENVIDX" | cut -c1-180 | sed 's/^/    /'
+[ $IDX_HIT -eq 0 ] && ok "No custom language package indexes"
+
+# =====================================================================
+section "8. Logs (last 7 days)"
 info "Reading unified logs, this may take a few minutes..."
 
 SSH_OK=$(log show --last 7d --style syslog --predicate 'process == "sshd" AND eventMessage CONTAINS "Accepted"' 2>/dev/null | grep "Accepted")

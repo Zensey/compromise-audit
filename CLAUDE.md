@@ -4,6 +4,7 @@ Standalone, read-only compromise audits that print to the console.
 
 - `mac_audit.sh` — macOS
 - `linux_audit.sh` — Linux (systemd distros: Debian/Ubuntu, RHEL/Fedora, Arch, SUSE)
+- `k8s_audit.sh` — Kubernetes (node components + `kubectl` workload checks); its own system type, not part of the Linux script
 
 ## Rules
 
@@ -36,7 +37,15 @@ Not testable in Docker: systemd units/timers, `journalctl`, kernel-module and fi
 - Avoid sed backreferences (`\1`) when editing via scripts: a non-raw Python string turns `\1` into the control character `\x01` and `bash -n` still passes. Prefer sed forms without backreferences, and check with `grep -c $'\x01' <script>`.
 - Debian container images create `/usr/sbin/policy-rc.d`; it is allowlisted in the unowned-executables check.
 
+- `ORIG_PATH` is saved before the script overrides `PATH`; the PATH-hijack check uses it. A symlinked directory such as `/bin` -> `usr/bin` looks world-writable to `find`; use `find -L`.
+- In Docker (and on fresh installs) several "changed in the last N days" checks fire because everything was just installed; expect a few CHECKs on a clean container (apt sources, PAM files, account files, MAC/firewall/LUKS absence, sysctl values inherited from the host kernel).
+- The systemd and Docker code paths in `linux_audit.sh` are tested with shims (a fake `systemctl` plus `/run/systemd/system`, a fake `docker` printing canned lines). `k8s_audit.sh` is tested in Debian with a fake `kubectl` (answers `current-context`, `view`, `pods`), a risky manifest in `/etc/kubernetes/manifests`, and `nc -l 0.0.0.0 10255`/`10250` listeners; also run it on a plain host to confirm it reports "Nothing was checked"; the `bpftool` parsing was tested against a real privileged container.
+
 ## Known gaps
 
-- The macOS signature-integrity and sealed-volume checks were written without access to a Mac and have not been run; test them on a real machine.
+- `k8s_audit.sh` has not been run against a real cluster or node (only shims); its `kubectl` jsonpath output format and k3s/rke2 node detection are unverified.
+- Not exercised on a real host: `needrestart`, `needs-restarting`, `dnf`/`zypper` update checks, `twprint`, the Firefox `certutil` and Java `keytool` paths, kernel-module cross-check with a genuinely hidden module.
+
+- The macOS signature-integrity, sealed-volume, connection-context, reverse-shell (`lsof -a -i -d 0,1`), listener, interface, `systemsetup` NTP and Homebrew checks were written without access to a Mac and have not been run; test them on a real machine (also under the stock bash 3.2: no associative arrays, no `${var,,}`). Only the user-environment section's logic was exercised, in Debian with a `stat` shim.
+- Home directories are word-split in `for` loops (`$ALL_HOMES`); home paths with spaces are not handled.
 - Rootkits can hide from any check run on the audited system; a clean result is not proof.
